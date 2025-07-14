@@ -1,5 +1,6 @@
 import torch
 import vllm.envs as envs_vllm
+import vllm_ascend.envs as envs_ascend
 from vllm.attention.layer import Attention
 from vllm.config import (VllmConfig, get_layers_from_vllm_config,
                          set_current_vllm_config)
@@ -181,13 +182,13 @@ class MtpProposer:
             not self.runner.with_prefill and self.is_mtp_torchair_ready
 
         if is_running_torchair:
-            if num_tokens == 1:
+            if num_tokens == batch_size:
                 self.runner.attn_state = AscendAttentionState.DecodeOnly
             num_reqs_pad_size = self.runner.num_reqs_pad_size
             extra_builder_kwargs['num_reqs_pad_size'] = num_reqs_pad_size
             # Assume num token per request is one
             extra_builder_kwargs['num_token_pad_size'] = num_reqs_pad_size
-            num_input_tokens = self.runner.num_reqs_pad_size
+            num_input_tokens = num_tokens + self.runner.num_reqs_pad_size
         else:
             extra_builder_kwargs['num_token_pad_size'] = -1
             extra_builder_kwargs['num_reqs_pad_size'] = 0
@@ -199,7 +200,7 @@ class MtpProposer:
             max_query_len=max_query_len,
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
-            is_mtp_model=True,
+            is_mtp_model=False,
             **extra_builder_kwargs)
 
         self.positions[:num_tokens] = target_positions
@@ -212,7 +213,8 @@ class MtpProposer:
         with set_ascend_forward_context(attn_metadata,
                                         self.vllm_config,
                                         num_tokens=num_input_tokens,
-                                        with_prefill=self.runner.with_prefill):
+                                        with_prefill=self.runner.with_prefill,
+                                        num_tokens_across_dp=num_input_tokens):
             with ProfileExecuteDuration().capture_async('mtp_forward'):
                 model_kwargs = {}
                 model_kwargs["attn_metadata"] = attn_metadata
@@ -307,16 +309,54 @@ class MtpProposer:
 
     @torch.inference_mode()
     def dummy_run(self, num_tokens: int, with_prefill: bool = False) -> None:
-        attn_metadata = self.runner.attn_metadata_builder.build_torchair_graph_dummy(
-            num_reqs=num_tokens, num_actual_tokens=1, is_mtp_model=True)
-        with set_ascend_forward_context(None,
+        is_running_torchair = self.runner.torchair_graph_enabled and \
+            not self.runner.with_prefill and self.is_mtp_torchair_ready
+        if is_running_torchair:
+            self.runner.attn_state = AscendAttentionState.DecodeOnly
+            attn_metadata = self.runner.attn_metadata_builder.build_torchair_graph_dummy(
+                num_reqs=num_tokens, num_actual_tokens=1)
+        else:
+            attn_metadata = None
+        
+        with set_ascend_forward_context(attn_metadata,
                                         self.vllm_config,
                                         num_tokens=num_tokens,
-                                        with_prefill=with_prefill):
-            self.model(input_ids=self.input_ids[:num_tokens],
-                       positions=self.positions[:num_tokens],
-                       previous_hidden_states=self.hidden_states[:num_tokens],
-                       attn_metadata=attn_metadata)
+                                        with_prefill=self.runner.with_prefill,
+                                        num_tokens_across_dp=num_tokens):
+            with ProfileExecuteDuration().capture_async('mtp_forward'):
+                model_kwargs = {}
+                model_kwargs["attn_metadata"] = attn_metadata
+                if self.runner.torchair_graph_enabled and not with_prefill:
+                    model_kwargs["kv_caches"] = self.runner.kv_caches[-1:]
+                    torch._dynamo.mark_static(self.input_ids)
+                    torch._dynamo.mark_static(self.positions)
+                    torch._dynamo.mark_static(attn_metadata.decode.block_table)
+                    torch._dynamo.mark_static(
+                        attn_metadata.decode.input_positions)
+                    torch._dynamo.mark_static(attn_metadata.slot_mapping)
+                    torch._dynamo.mark_static(attn_metadata.decode.attn_mask)
+                    for kv in self.runner.kv_caches:
+                        assert isinstance(kv,
+                                          tuple), "kv_cache must be a tuple"
+                        torch._dynamo.mark_static(kv[0])
+                        torch._dynamo.mark_static(kv[1])
+                    self.torchair_compiled_model(
+                        input_ids=self.input_ids[:num_tokens],
+                        positions=self.positions[:num_tokens],
+                        previous_hidden_states=self.
+                        hidden_states[:num_tokens],
+                        inputs_embeds=None,
+                        **model_kwargs)
+                else:
+                    if envs_ascend.VLLM_ASCEND_ENABLE_DBO:
+                        model_kwargs['graph_enable'] = False
+                    self.model(
+                        input_ids=self.input_ids[:num_tokens],
+                        positions=self.positions[:num_tokens],
+                        previous_hidden_states=self.
+                        hidden_states[:num_tokens],
+                        attn_metadata=attn_metadata,
+                        kv_caches=self.runner.kv_caches[-1:])
 
 
 # TODO Using torch instead of triton may result in poor performance

@@ -1626,6 +1626,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # NOTE: If torchair graph mode and not with_prefill,
         # we can't skip_attn, it will cause graph recompile.
         if self.torchair_graph_enabled and not with_prefill:
+            if self.speculative_config and self.speculative_config.method == 'deepseek_mtp':
+                self.attn_state = AscendAttentionState.SpecDecoding
+            else:
+                self.attn_state = AscendAttentionState.DecodeOnly
             attn_metadata = self.attn_metadata_builder.build_torchair_graph_dummy(
                 num_reqs=num_reqs, num_actual_tokens=1)
         elif skip_attn:

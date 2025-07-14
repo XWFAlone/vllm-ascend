@@ -323,7 +323,10 @@ class AscendMLAMetadataBuilder:
                                   device=device)
         block_table = self._get_graph_runner_block_tables(
             num_reqs, block_table)
-        num_tokens = num_reqs * self.runner.decode_token_per_req
+        if self.runner.attn_state == AscendAttentionState.SpecDecoding:
+            num_tokens = num_reqs * self.runner.decode_token_per_req
+        else:
+            num_tokens = num_reqs
         seq_lens = torch.zeros(num_reqs, dtype=torch.int32, device=device)
         seq_lens_list = [0] * num_reqs
         input_positions = torch.zeros(num_tokens,
@@ -337,12 +340,9 @@ class AscendMLAMetadataBuilder:
                                      -1,
                                      dtype=torch.int32,
                                      device=device)
-        if self.runner.speculative_config is not None and\
-            self.runner.speculative_config.method == 'deepseek_mtp' and not is_mtp_model:
-            attn_state = AscendAttentionState.SpecDecoding
+        if self.runner.attn_state == AscendAttentionState.SpecDecoding:
             num_decode_tokens = 2
         else:
-            attn_state = AscendAttentionState.DecodeOnly
             num_decode_tokens = 1
         sin = torch.ones(num_tokens,
                          1,
@@ -375,7 +375,7 @@ class AscendMLAMetadataBuilder:
             num_decode_tokens=num_decode_tokens,
             num_prefills=0,
             attn_mask=self.runner.attn_mask,
-            attn_state=attn_state,
+            attn_state=self.runner.attn_state,
             prefill=None,
             decode=decode_metadata,
             query_start_loc=query_start_loc,
